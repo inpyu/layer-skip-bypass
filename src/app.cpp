@@ -250,6 +250,27 @@ static NnUint sampleArgmaxToken(const float *logits, NnUint logitsDim) {
     return bestIdx;
 }
 
+static float computeLogitMargin(const float *logits, NnUint logitsDim) {
+    if (logits == nullptr || logitsDim < 2u)
+        return -1.0f;
+    float best = -std::numeric_limits<float>::infinity();
+    float second = -std::numeric_limits<float>::infinity();
+    for (NnUint i = 0; i < logitsDim; i++) {
+        const float v = logits[i];
+        if (!std::isfinite(v))
+            continue;
+        if (v > best) {
+            second = best;
+            best = v;
+        } else if (v > second) {
+            second = v;
+        }
+    }
+    if (!std::isfinite(best) || !std::isfinite(second))
+        return -1.0f;
+    return best - second;
+}
+
 static void packTopKLogits(const float *logits, NnUint logitsDim, NnUint k, std::vector<float> &packed) {
     if (k == 0 || logitsDim == 0) {
         packed.clear();
@@ -377,6 +398,9 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.ppStageSkipVerifierDelta = true;
     args.ppStageSkipMaxConsecutive = 3;
     args.ppStageSkipMaxRejectStreak = 8;
+    args.ppStageSkipMinLogitMargin = -1.0f;
+    args.ppStageSkipCheckpointMargin = -1.0f;
+    args.ppStageSkipCooldown = 0u;
     args.ppStageSkipLog = false;
     args.ppStageSkipLogFile = nullptr;
     args.gpuIndex = -1;
@@ -534,6 +558,12 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.ppStageSkipMaxConsecutive = (NnUint)atoi(value);
         } else if (std::strcmp(name, "--pp-stage-skip-max-reject-streak") == 0) {
             args.ppStageSkipMaxRejectStreak = (NnUint)atoi(value);
+        } else if (std::strcmp(name, "--pp-stage-skip-min-logit-margin") == 0) {
+            args.ppStageSkipMinLogitMargin = (float)atof(value);
+        } else if (std::strcmp(name, "--pp-stage-skip-checkpoint-margin") == 0) {
+            args.ppStageSkipCheckpointMargin = (float)atof(value);
+        } else if (std::strcmp(name, "--pp-stage-skip-cooldown") == 0) {
+            args.ppStageSkipCooldown = (NnUint)atoi(value);
         } else if (std::strcmp(name, "--pp-stage-skip-log") == 0) {
             args.ppStageSkipLog = atoi(value) == 1;
         } else if (std::strcmp(name, "--pp-stage-skip-log-file") == 0) {
@@ -561,6 +591,10 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         throw std::runtime_error("pp-stage-skip-max-consecutive must be >= 1");
     if (args.ppStageSkipMaxRejectStreak < 1)
         throw std::runtime_error("pp-stage-skip-max-reject-streak must be >= 1");
+    if (args.ppStageSkipMinLogitMargin < -1.0f)
+        throw std::runtime_error("pp-stage-skip-min-logit-margin must be >= -1");
+    if (args.ppStageSkipCheckpointMargin < -1.0f)
+        throw std::runtime_error("pp-stage-skip-checkpoint-margin must be >= -1");
     return args;
 }
 
@@ -647,6 +681,9 @@ RootLlmInference::RootLlmInference(
     float stageSkipTheta,
     NnUint stageSkipMaxConsecutive,
     NnUint stageSkipMaxRejectStreak,
+    float stageSkipMinLogitMargin,
+    float stageSkipCheckpointMargin,
+    NnUint stageSkipCooldown,
     bool stageSkipLog
 ) {
     this->header = net->header;
@@ -669,6 +706,8 @@ RootLlmInference::RootLlmInference(
     this->topKIndices.resize(topKCount);
     this->topKLogits.resize(topKCount);
     this->topKPacked.resize((size_t)topKCount * 2u);
+    this->lastStageSkipLogitMargin = -1.0f;
+    this->hasLastStageSkipLogitMargin = false;
     if (network != nullptr && topology->ppSize > 1) {
         this->pipeline.reset(new NnPipelineCommunicator(
             network,
@@ -690,11 +729,22 @@ RootLlmInference::RootLlmInference(
     controlPacket.stageSkipEnabled = stageSkipEnabled ? 1u : 0u;
     controlPacket.stageSkipTarget = stageSkipTarget;
     controlPacket.stageSkipTheta = stageSkipTheta;
+    controlPacket.stageSkipPrevLogitMargin = -1.0f;
+    controlPacket.stageSkipMinLogitMargin = stageSkipMinLogitMargin;
+    controlPacket.stageSkipCheckpointMargin = stageSkipCheckpointMargin;
     controlPacket.stageSkipMaxConsecutive = stageSkipMaxConsecutive;
     controlPacket.stageSkipMaxRejectStreak = stageSkipMaxRejectStreak;
+    controlPacket.stageSkipCooldown = stageSkipCooldown;
     controlPacket.stageSkipLog = stageSkipLog ? 1u : 0u;
     controlPacket.positionMode = 0u;
     setDecodePhase(false);
+}
+
+void RootLlmInference::updateStageSkipLogitMargin(const float *logits, NnUint logitsDim) {
+    const float margin = computeLogitMargin(logits, logitsDim);
+    lastStageSkipLogitMargin = margin;
+    hasLastStageSkipLogitMargin = margin >= 0.0f;
+    controlPacket.stageSkipPrevLogitMargin = hasLastStageSkipLogitMargin ? margin : -1.0f;
 }
 
 void RootLlmInference::setDecodePhase(bool isDecodePhase) {
@@ -717,10 +767,15 @@ NnUint RootLlmInference::getTokenFromWorker() const {
 int RootLlmInference::sampleToken(Sampler *sampler) {
     if (sampler == nullptr)
         throw std::runtime_error("Sampler is null");
-    if (decodeLogitsMode == 1u && controlPacket.phase == 1u && controlPacket.batchSize == 1u)
+    if (decodeLogitsMode == 1u && controlPacket.phase == 1u && controlPacket.batchSize == 1u) {
+        controlPacket.stageSkipPrevLogitMargin = -1.0f;
         return (int)tokenFromWorker;
-    if (decodeLogitsMode == 2u && controlPacket.phase == 1u && controlPacket.batchSize == 1u)
+    }
+    if (decodeLogitsMode == 2u && controlPacket.phase == 1u && controlPacket.batchSize == 1u) {
+        updateStageSkipLogitMargin(topKLogits.data(), controlPacket.topKCount);
         return sampler->sampleTopK(topKIndices.data(), topKLogits.data(), (int)controlPacket.topKCount);
+    }
+    updateStageSkipLogitMargin(logitsPipe, header->vocabSize);
     return sampler->sample(logitsPipe);
 }
 
@@ -734,7 +789,17 @@ int RootLlmInference::sampleTokenAtBatch(Sampler *sampler, NnUint batchIndex) {
         // Fallback to full logits sampling when batch > 1.
     }
     const NnUint stride = logitsPipeRowBytes / sizeof(float);
-    return sampler->sample(logitsPipe + (size_t)batchIndex * stride);
+    float *batchLogits = logitsPipe + (size_t)batchIndex * stride;
+    if (batchIndex == 0u)
+        updateStageSkipLogitMargin(batchLogits, header->vocabSize);
+    return sampler->sample(batchLogits);
+}
+
+void RootLlmInference::captureStageSkipLogitMarginAtBatch(NnUint batchIndex) {
+    if (batchIndex >= controlPacket.batchSize)
+        throw std::runtime_error("captureStageSkipLogitMarginAtBatch batchIndex out of range");
+    const NnUint stride = logitsPipeRowBytes / sizeof(float);
+    updateStageSkipLogitMargin(logitsPipe + (size_t)batchIndex * stride, header->vocabSize);
 }
 
 bool RootLlmInference::getDecodeRecvWaitStats(float *p50Ms, float *p95Ms) const {
@@ -1005,6 +1070,10 @@ WorkerLlmInference::WorkerLlmInference(
     this->skipConsecutiveAccepts = 0u;
     this->skipRejectStreak = 0u;
     this->skipForcedFullByRejectStreak = 0u;
+    this->lastSkipConfidencePass = true;
+    this->skipCooldownRemaining = 0u;
+    this->skipPrevWasCheckpointFull = false;
+    this->skipCheckpointForcedFull = 0u;
     this->skipLogFile = nullptr;
     this->skipLogRunId = (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1042,7 +1111,7 @@ WorkerLlmInference::WorkerLlmInference(
         this->skipLogFile = std::fopen(path, "a");
         if (this->skipLogFile != nullptr) {
             std::fprintf(this->skipLogFile,
-                "run_id\tnode\tpp\tpos\ttarget_stage\tdelta_norm\tgate_pass\tverifier_score\tverifier_pass\twas_skip\tfallback\tconsecutive_skip\treject_streak\tforced_full_total\trecv_wait_ms\twall_step_ms\ttoken_id\tis_special\ttoken_text\n");
+                "run_id\tnode\tpp\tpos\ttarget_stage\tdelta_norm\tgate_pass\tverifier_score\tverifier_pass\twas_skip\tfallback\tconsecutive_skip\treject_streak\tforced_full_total\trecv_wait_ms\twall_step_ms\ttoken_id\tis_special\ttoken_text\tprev_logit_margin\tconfidence_pass\tcooldown_remaining\tcheckpoint_forced_total\n");
             std::fflush(this->skipLogFile);
             this->skipLogHeaderWritten = true;
             printf("🧪 Opened pp-stage-skip log file: %s\n", path);
@@ -1104,12 +1173,18 @@ bool WorkerLlmInference::tryReadControlPacket() {
         skipConsecutiveAccepts = 0u;
         skipRejectStreak = 0u;
         skipForcedFullByRejectStreak = 0u;
+        skipCooldownRemaining = 0u;
+        skipPrevWasCheckpointFull = false;
+        skipCheckpointForcedFull = 0u;
     }
     if (prevDecodePhase && !decodePhase) {
         hasPrevXPipeRow = false;
         skipConsecutiveAccepts = 0u;
         skipRejectStreak = 0u;
         skipForcedFullByRejectStreak = 0u;
+        skipCooldownRemaining = 0u;
+        skipPrevWasCheckpointFull = false;
+        skipCheckpointForcedFull = 0u;
     }
     if (controlPacket.activationType <= (NnUint)F_Q80)
         pipelineActivationType = (NnFloatType)controlPacket.activationType;
@@ -1182,10 +1257,32 @@ void WorkerLlmInference::evaluateStageSkipDecision() {
     const unsigned long long tVerifier0 = nowUs();
     hasLastSkipDecision = true;
     lastSkipDecisionScore = lastDeltaNorm;
+    if (skipPrevWasCheckpointFull) {
+        if (controlPacket.stageSkipCheckpointMargin >= 0.0f &&
+            controlPacket.stageSkipPrevLogitMargin >= 0.0f &&
+            controlPacket.stageSkipPrevLogitMargin < controlPacket.stageSkipCheckpointMargin) {
+            skipCooldownRemaining = std::max(skipCooldownRemaining, controlPacket.stageSkipCooldown);
+        }
+        skipPrevWasCheckpointFull = false;
+    }
+
+    const NnUint cooldownBeforeDecision = skipCooldownRemaining;
     bool accept = lastDeltaNorm <= controlPacket.stageSkipTheta;
+    lastSkipConfidencePass = true;
+    if (accept && controlPacket.stageSkipMinLogitMargin >= 0.0f) {
+        lastSkipConfidencePass =
+            controlPacket.stageSkipPrevLogitMargin >= controlPacket.stageSkipMinLogitMargin;
+        if (!lastSkipConfidencePass)
+            accept = false;
+    }
     bool forceFullByRejectStreak = false;
-    if (accept && skipConsecutiveAccepts >= controlPacket.stageSkipMaxConsecutive)
+    bool forceFullByMaxConsecutive = false;
+    if (accept && cooldownBeforeDecision > 0u)
         accept = false;
+    if (accept && skipConsecutiveAccepts >= controlPacket.stageSkipMaxConsecutive) {
+        accept = false;
+        forceFullByMaxConsecutive = true;
+    }
     if (skipRejectStreak >= controlPacket.stageSkipMaxRejectStreak) {
         // Dampening: force one full-path token after a long reject streak.
         accept = false;
@@ -1203,7 +1300,13 @@ void WorkerLlmInference::evaluateStageSkipDecision() {
         } else {
             skipRejectStreak++;
         }
+        if (forceFullByMaxConsecutive) {
+            skipPrevWasCheckpointFull = true;
+            skipCheckpointForcedFull++;
+        }
     }
+    if (cooldownBeforeDecision > 0u)
+        skipCooldownRemaining = cooldownBeforeDecision - 1u;
     const unsigned long long tVerifier1 = nowUs();
     stageVerifierUs.push_back((NnUint)(tVerifier1 - tVerifier0));
 }
@@ -1238,22 +1341,27 @@ void WorkerLlmInference::recordStageTiming(NnUint recvUs, NnUint fwdUs, NnUint s
         if (controlPacket.stageSkipLog == 1u) {
             const NnUint rejectStreakNow = skipRejectStreak;
             const NnUint consecNow = skipConsecutiveAccepts;
-            printf("🧪 [WORKER_SKIP_TOKEN] node=%u pp=%u pos=%u delta_norm=%.6f score=%.6f theta=%.6f accept=%u consecutive_skip=%u reject_streak=%u forced_full_total=%u mode=%s\n",
+            printf("🧪 [WORKER_SKIP_TOKEN] node=%u pp=%u pos=%u delta_norm=%.6f score=%.6f theta=%.6f prev_logit_margin=%.6f min_logit_margin=%.6f confidence_pass=%u accept=%u consecutive_skip=%u reject_streak=%u cooldown_remaining=%u forced_full_total=%u checkpoint_forced_total=%u mode=%s\n",
                 nodeConfig->nodeIndex,
                 nodeConfig->ppRank,
                 controlPacket.position,
                 lastSkipDecisionScore,
                 lastSkipDecisionScore,
                 controlPacket.stageSkipTheta,
+                controlPacket.stageSkipPrevLogitMargin,
+                controlPacket.stageSkipMinLogitMargin,
+                lastSkipConfidencePass ? 1u : 0u,
                 lastSkipDecisionAccept,
                 consecNow,
                 rejectStreakNow,
+                skipCooldownRemaining,
                 skipForcedFullByRejectStreak,
+                skipCheckpointForcedFull,
                 controlPacket.stageSkipEnabled == 1u ? "execute" : "shadow");
         }
         if (skipLogFile != nullptr) {
             std::fprintf(skipLogFile,
-                "%llu\t%u\t%u\t%u\t%u\t%.6f\t%u\t%.6f\t%u\t%u\t%u\t%u\t%u\t%u\t%.3f\t%.3f\t-1\t-1\t\n",
+                "%llu\t%u\t%u\t%u\t%u\t%.6f\t%u\t%.6f\t%u\t%u\t%u\t%u\t%u\t%u\t%.3f\t%.3f\t-1\t-1\t\t%.6f\t%u\t%u\t%u\n",
                 skipLogRunId,
                 nodeConfig->nodeIndex,
                 nodeConfig->ppRank,
@@ -1269,7 +1377,11 @@ void WorkerLlmInference::recordStageTiming(NnUint recvUs, NnUint fwdUs, NnUint s
                 skipRejectStreak,
                 skipForcedFullByRejectStreak,
                 recvUs / 1000.0f,
-                totalUs / 1000.0f);
+                totalUs / 1000.0f,
+                controlPacket.stageSkipPrevLogitMargin,
+                lastSkipConfidencePass ? 1u : 0u,
+                skipCooldownRemaining,
+                skipCheckpointForcedFull);
             std::fflush(skipLogFile);
         }
     }
@@ -1365,7 +1477,7 @@ void WorkerLlmInference::printStageTimingSummary() const {
             ? 0.0f
             : (float)std::accumulate(stageVerifierUs.begin(), stageVerifierUs.end(), 0.0) /
                 (1000.0f * (float)stageVerifierUs.size());
-        printf("🧪 [WORKER_SKIP_SUMMARY] node=%u pp=%u sp=%u n=%zu delta_norm(p50/p95)=%.6f/%.6f theta=%.6f accept_rate=%.4f reject_rate=%.4f fallback_rate=%.4f verifier_avg_ms=%.4f forced_full=%u target=%u mode=%s\n",
+        printf("🧪 [WORKER_SKIP_SUMMARY] node=%u pp=%u sp=%u n=%zu delta_norm(p50/p95)=%.6f/%.6f theta=%.6f min_logit_margin=%.6f checkpoint_margin=%.6f cooldown=%u accept_rate=%.4f reject_rate=%.4f fallback_rate=%.4f verifier_avg_ms=%.4f forced_full=%u checkpoint_forced=%u target=%u mode=%s\n",
             nodeConfig->nodeIndex,
             nodeConfig->ppRank,
             nodeConfig->spRank,
@@ -1373,11 +1485,15 @@ void WorkerLlmInference::printStageTimingSummary() const {
             deltaP50,
             deltaP95,
             controlPacket.stageSkipTheta,
+            controlPacket.stageSkipMinLogitMargin,
+            controlPacket.stageSkipCheckpointMargin,
+            controlPacket.stageSkipCooldown,
             acceptRate,
             rejectRate,
             fallbackRate,
             verifierAvgMs,
             skipForcedFullByRejectStreak,
+            skipCheckpointForcedFull,
             controlPacket.stageSkipTarget,
             controlPacket.stageSkipEnabled == 1u ? "execute" : "shadow");
     }
@@ -1562,6 +1678,11 @@ void WorkerLlmInference::afterForward() {
 }
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
+    if (args->modelPath == nullptr || args->modelPath[0] == '\0')
+        throw std::runtime_error("--model is required");
+    if (args->tokenizerPath == nullptr || args->tokenizerPath[0] == '\0')
+        throw std::runtime_error("--tokenizer is required");
+
     NnUint nNodes = args->nWorkers + 1;
 
     // For distributed CPU runs, default to PP-first unless user explicitly set PP/SP.
@@ -1688,6 +1809,9 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         args->ppStageSkipTheta,
         args->ppStageSkipMaxConsecutive,
         args->ppStageSkipMaxRejectStreak,
+        args->ppStageSkipMinLogitMargin,
+        args->ppStageSkipCheckpointMargin,
+        args->ppStageSkipCooldown,
         args->ppStageSkipLog
     );
 
@@ -1731,12 +1855,15 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
             printf("🧮 Pipeline delta transport: ENABLED (minBytes=%u, wireDtype=%s)\n",
                 args->pipelineDeltaMinBytes, floatTypeToString(pipelineActivationType));
         if (args->ppStageSkipShadow || args->ppStageSkip) {
-            printf("🧪 PP stage-skip: mode=%s target=%u theta=%.6f maxConsecutive=%u maxRejectStreak=%u log=%s\n",
+            printf("🧪 PP stage-skip: mode=%s target=%u theta=%.6f maxConsecutive=%u maxRejectStreak=%u minLogitMargin=%.6f checkpointMargin=%.6f cooldown=%u log=%s\n",
                 args->ppStageSkip ? "execute" : "shadow",
                 args->ppStageSkipTarget,
                 args->ppStageSkipTheta,
                 args->ppStageSkipMaxConsecutive,
                 args->ppStageSkipMaxRejectStreak,
+                args->ppStageSkipMinLogitMargin,
+                args->ppStageSkipCheckpointMargin,
+                args->ppStageSkipCooldown,
                 args->ppStageSkipLog ? "on" : "off");
         }
         if (args->concurrentPrefillDecode) {
