@@ -324,6 +324,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.tokenizerPath = nullptr;
     args.prompt = nullptr;
     args.promptsFile = nullptr;
+    args.cleanOutputPrefix = nullptr;
     args.syncType = F_32;
     args.nWorkers = 0;
     args.workerHosts = nullptr;
@@ -407,6 +408,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.prompt = value;
         } else if (std::strcmp(name, "--prompts-file") == 0) {
             args.promptsFile = value;
+        } else if (std::strcmp(name, "--clean-output-prefix") == 0) {
+            args.cleanOutputPrefix = value;
         } else if (std::strcmp(name, "--buffer-float-type") == 0) {
             args.syncType = parseFloatType(value);
         } else if (std::strcmp(name, "--workers") == 0) {

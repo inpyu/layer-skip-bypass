@@ -6,6 +6,7 @@
 *.data
 *.temp
 *.tmp
+*.text
 __pycache__
 /.worktrees/
 

@@ -64,6 +64,7 @@ public:
     char *tokenizerPath;
     char *prompt;
     char *promptsFile;
+    char *cleanOutputPrefix;
     NnFloatType syncType;
     NnUint nWorkers;
     char **workerHosts;

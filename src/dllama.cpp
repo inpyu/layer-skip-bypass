@@ -12,6 +12,9 @@
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <cerrno>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 struct CbRequestState {
     std::vector<int> tokens;
@@ -36,6 +39,101 @@ static std::vector<std::string> loadPromptsFromFile(const char *path) {
     if (prompts.empty())
         throw std::runtime_error("prompts-file is empty");
     return prompts;
+}
+
+static bool fileExists(const std::string &path) {
+    std::ifstream ifs(path.c_str(), std::ios::binary);
+    return ifs.good();
+}
+
+static bool ensureParentDirectoryForFileLocal(const std::string &filePath) {
+    const size_t slash = filePath.find_last_of('/');
+    if (slash == std::string::npos)
+        return true;
+    std::string dir = filePath.substr(0, slash);
+    if (dir.empty())
+        return true;
+
+    std::string current;
+    if (dir[0] == '/')
+        current = "/";
+
+    std::stringstream ss(dir);
+    std::string part;
+    while (std::getline(ss, part, '/')) {
+        if (part.empty())
+            continue;
+        if (!current.empty() && current[current.size() - 1] != '/')
+            current += "/";
+        current += part;
+        if (::mkdir(current.c_str(), 0755) != 0 && errno != EEXIST)
+            return false;
+    }
+    return true;
+}
+
+static std::string hexEncodeBytes(const char *text) {
+    if (text == nullptr)
+        return "";
+    static const char *digits = "0123456789abcdef";
+    std::string out;
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(text);
+    while (*p != '\0') {
+        out.push_back(digits[(*p >> 4) & 0x0f]);
+        out.push_back(digits[*p & 0x0f]);
+        p++;
+    }
+    return out;
+}
+
+static std::string escapeTsv(const char *text) {
+    if (text == nullptr)
+        return "";
+    std::string out;
+    for (const char *p = text; *p != '\0'; p++) {
+        switch (*p) {
+        case '\t':
+            out += "\\t";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        default:
+            out.push_back(*p);
+            break;
+        }
+    }
+    return out;
+}
+
+static void openCleanOutputDumps(const char *prefix, std::ofstream *tokenDump, std::ofstream *textDump) {
+    const std::string base(prefix);
+    const std::string tokenPath = base + ".tokens.tsv";
+    const std::string textPath = base + ".text";
+
+    if (fileExists(tokenPath))
+        throw std::runtime_error("Clean output dump would overwrite existing file: " + tokenPath);
+    if (fileExists(textPath))
+        throw std::runtime_error("Clean output dump would overwrite existing file: " + textPath);
+    if (!ensureParentDirectoryForFileLocal(tokenPath))
+        throw std::runtime_error("Cannot create parent directory for clean output dump: " + tokenPath);
+    if (!ensureParentDirectoryForFileLocal(textPath))
+        throw std::runtime_error("Cannot create parent directory for clean output dump: " + textPath);
+
+    tokenDump->open(tokenPath.c_str(), std::ios::out | std::ios::binary);
+    if (!tokenDump->is_open())
+        throw std::runtime_error("Cannot open clean token dump: " + tokenPath);
+    textDump->open(textPath.c_str(), std::ios::out | std::ios::binary);
+    if (!textDump->is_open())
+        throw std::runtime_error("Cannot open clean text dump: " + textPath);
+
+    (*tokenDump) << "step\tposition\ttoken_id\tis_eos\tpiece_hex\tpiece_utf8_escaped\n";
 }
 
 static void inferenceContinuousBatching(AppInferenceContext *context) {
@@ -195,6 +293,11 @@ static void inference(AppInferenceContext *context) {
 
     int token = inputTokens[pos];
     printf("%s\n", context->args->prompt);
+    std::ofstream cleanTokenDump;
+    std::ofstream cleanTextDump;
+    const bool cleanOutputEnabled = context->args->cleanOutputPrefix != nullptr;
+    if (cleanOutputEnabled)
+        openCleanOutputDumps(context->args->cleanOutputPrefix, &cleanTokenDump, &cleanTextDump);
     const NnUint nPrefillTokens = nInputTokens > 0 ? (NnUint)(nInputTokens - 1) : 0;
     const NnUint prefillBatchCap = resolvePrefillChunkBatchSize(context->args, nPrefillTokens);
     const bool useWave = context->args->wavePipeline && context->args->ppSize > 1;
@@ -355,6 +458,16 @@ static void inference(AppInferenceContext *context) {
         token = context->inference->sampleToken(context->sampler);
 
         char *piece = context->tokenizer->decode(token);
+        if (cleanOutputEnabled) {
+            cleanTokenDump << decodeStepIndex << '\t'
+                           << pos << '\t'
+                           << token << '\t'
+                           << (context->tokenizer->isEos(token) ? 1 : 0) << '\t'
+                           << hexEncodeBytes(piece) << '\t'
+                           << escapeTsv(piece) << '\n';
+            if (piece != nullptr)
+                cleanTextDump << piece;
+        }
         if (!hasFirstPredToken) {
             ttftWallUs = wallClock.elapsedMicroseconds();
             firstTokenEmitUs = ttftWallUs;
@@ -412,6 +525,10 @@ static void inference(AppInferenceContext *context) {
     }
     if (context->args->decodeLogInterval == 0)
         printf("\n");
+    if (cleanOutputEnabled) {
+        cleanTokenDump.flush();
+        cleanTextDump.flush();
+    }
 
     NnUint nEvalTokens = nInputTokens - 1;
     NnUint nPredTokens = pos - nEvalTokens;
@@ -644,6 +761,7 @@ static void printUsage() {
     printf("  --nthreads <n>\n");
     printf("  --buffer-float-type <f32|f16|q40|q80>\n");
     printf("  --prompts-file <path>       Enable multi-request continuous batching input (1 prompt per line)\n");
+    printf("  --clean-output-prefix <path_prefix>  Write generated tokens/text to <prefix>.tokens.tsv and <prefix>.text without overwriting\n");
     printf("  --decode-cb-max-active <n>  Max active requests per decode step in continuous batching (default: nBatches)\n");
     printf("  --workers <host:port> [host:port ...]\n");
     printf("  --collective <auto|star|ring>\n");
