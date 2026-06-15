@@ -112,9 +112,6 @@ public:
     bool ppStageSkipVerifierDelta;
     NnUint ppStageSkipMaxConsecutive;
     NnUint ppStageSkipMaxRejectStreak;
-    float ppStageSkipMinLogitMargin;
-    float ppStageSkipCheckpointMargin;
-    NnUint ppStageSkipCooldown;
     bool ppStageSkipLog;
     char *ppStageSkipLogFile;
     int gpuIndex;
@@ -146,12 +143,8 @@ typedef struct {
     NnUint stageSkipEnabled; // 0 = off, 1 = execute
     NnUint stageSkipTarget; // pp rank to bypass
     float stageSkipTheta; // gate+verifier threshold (delta_norm)
-    float stageSkipPrevLogitMargin; // previous decode token top1-top2 logit margin; <0 means unavailable
-    float stageSkipMinLogitMargin; // optional confidence gate; <0 means disabled
-    float stageSkipCheckpointMargin; // optional checkpoint margin threshold; <0 means disabled
     NnUint stageSkipMaxConsecutive;
     NnUint stageSkipMaxRejectStreak;
-    NnUint stageSkipCooldown;
     NnUint stageSkipLog; // 0 = off, 1 = token log on
     NnUint batchPositions[MAX_CONTROL_BATCH_POS];
     // Per-SP-group overrides (used when spSize > 1 for concurrent P/D)
@@ -188,9 +181,6 @@ private:
     std::vector<float> topKLogits;
     std::vector<float> topKPacked;
     std::vector<NnUint> decodeRecvWaitUs;
-    float lastStageSkipLogitMargin;
-    bool hasLastStageSkipLogitMargin;
-    void updateStageSkipLogitMargin(const float *logits, NnUint logitsDim);
 public:
     RootLlmInference(
         LlmNet *net,
@@ -212,9 +202,6 @@ public:
         float stageSkipTheta,
         NnUint stageSkipMaxConsecutive,
         NnUint stageSkipMaxRejectStreak,
-        float stageSkipMinLogitMargin,
-        float stageSkipCheckpointMargin,
-        NnUint stageSkipCooldown,
         bool stageSkipLog
     );
     void setDecodePhase(bool isDecodePhase);
@@ -223,7 +210,6 @@ public:
     NnUint getTokenFromWorker() const;
     int sampleToken(Sampler *sampler);
     int sampleTokenAtBatch(Sampler *sampler, NnUint batchIndex);
-    void captureStageSkipLogitMarginAtBatch(NnUint batchIndex);
     bool getDecodeRecvWaitStats(float *p50Ms, float *p95Ms) const;
     void setBatchSize(NnUint batchSize);
     void setPosition(NnUint position);
@@ -289,10 +275,6 @@ private:
     NnUint skipConsecutiveAccepts;
     NnUint skipRejectStreak;
     NnUint skipForcedFullByRejectStreak;
-    bool lastSkipConfidencePass;
-    NnUint skipCooldownRemaining;
-    bool skipPrevWasCheckpointFull;
-    NnUint skipCheckpointForcedFull;
     FILE *skipLogFile;
     unsigned long long skipLogRunId;
     bool skipLogHeaderWritten;

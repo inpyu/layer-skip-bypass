@@ -631,7 +631,6 @@ static void perplexity(AppInferenceContext *context) {
         context->inference->forward();
 
         float *logits = context->inference->logitsPipe;
-        context->inference->captureStageSkipLogitMarginAtBatch(0);
         softmax_F32(logits, context->header->vocabSize);
 
         int targetToken = inputTokens[pos + 1];
@@ -783,9 +782,6 @@ static void printUsage() {
     printf("  --pp-stage-skip-verifier <delta>  Verifier type (v1 supports only: delta)\n");
     printf("  --pp-stage-skip-max-consecutive <n>  Safety cap for consecutive skip decisions (default: 3)\n");
     printf("  --pp-stage-skip-max-reject-streak <n> Safety cap for reject streak before dampening (default: 8)\n");
-    printf("  --pp-stage-skip-min-logit-margin <f> Optional confidence gate using previous token top1-top2 logit margin; -1 disables (default: -1)\n");
-    printf("  --pp-stage-skip-checkpoint-margin <f> Trigger cooldown when a forced full checkpoint has margin below this value; -1 disables (default: -1)\n");
-    printf("  --pp-stage-skip-cooldown <n> Full-route tokens after a low-margin checkpoint (default: 0)\n");
     printf("  --pp-stage-skip-log <0|1>     Print per-token skip shadow logs on target stage (default: 0)\n");
     printf("  --pp-stage-skip-log-file <path_prefix>  Append per-token skip TSV logs as <path_prefix>.node<N>.tsv\n");
     printf("  --wall-metrics <0|1>        Print wall-clock decode metrics separately from executor metrics (default: 1)\n");
